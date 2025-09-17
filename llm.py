@@ -31,7 +31,7 @@ from transformers import (
     AutoConfig,
 )
 import PIL.Image
-from openai import AzureOpenAI,OpenAI
+from openai import AzureOpenAI, OpenAI, APIError, APITimeoutError, RateLimitError, AuthenticationError
 if torch.cuda.is_available():
     from transformers import BitsAndBytesConfig
 from google.protobuf.struct_pb2 import Struct
@@ -145,6 +145,41 @@ from .tools.flux_persona import flux_persona
 from .tools.workflow_V2 import workflow_transfer_v2
 os.environ["no_proxy"] = "localhost,127.0.0.1"
 enable_interpreter = True
+
+def retry_api_call(func, max_retries=3, base_delay=1):
+    """
+    指数退避重试机制
+    对网络错误、超时错误进行重试，对API错误直接抛出
+    """
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except (APITimeoutError, ConnectionError, OSError) as e:
+            if attempt == max_retries - 1:
+                print(f"❌ 网络连接失败，已重试{max_retries}次: {str(e)}")
+                raise e
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+            print(f"🔄 网络错误，{delay:.1f}秒后重试 (第{attempt+1}/{max_retries}次): {str(e)}")
+            time.sleep(delay)
+        except RateLimitError as e:
+            if attempt == max_retries - 1:
+                print(f"❌ API调用频率限制，已重试{max_retries}次: {str(e)}")
+                raise e
+            delay = 60 + random.uniform(0, 30)  # API限制错误等待更久
+            print(f"⏱️ API调用频率限制，{delay:.1f}秒后重试 (第{attempt+1}/{max_retries}次)")
+            time.sleep(delay)
+        except (APIError, AuthenticationError) as e:
+            # API错误和认证错误一般不需要重试
+            print(f"❌ API错误，不进行重试: {str(e)}")
+            raise e
+        except Exception as e:
+            # 其他未知错误，记录并重试
+            if attempt == max_retries - 1:
+                print(f"❌ 未知错误，已重试{max_retries}次: {str(e)}")
+                raise e
+            delay = base_delay * (2 ** attempt)
+            print(f"⚠️ 未知错误，{delay:.1f}秒后重试 (第{attempt+1}/{max_retries}次): {str(e)}")
+            time.sleep(delay)
 
 _TOOL_HOOKS = [
     "get_time",
@@ -463,6 +498,8 @@ class Chat:
             openai_client = OpenAI(
                     api_key= self.apikey,
                     base_url=self.baseurl,
+                    timeout=30.0,  # 30秒超时
+                    max_retries=0,  # 禁用内置重试，使用自定义重试
                 )
             if "openai.azure.com" in self.baseurl:
                 # 获取API版本
@@ -473,6 +510,8 @@ class Chat:
                     api_key= self.apikey,
                     api_version=api_version,
                     azure_endpoint=azure_endpoint,
+                    timeout=30.0,  # 30秒超时
+                    max_retries=0,  # 禁用内置重试，使用自定义重试
                 )
                 openai_client = azure
             new_message = {"role": "user", "content": user_prompt}
@@ -480,15 +519,17 @@ class Chat:
             print(history)
             reasoning_content = ""
             if tools is not None:
-                response = openai_client.chat.completions.create(
-                    model=self.model_name,
-                    messages=history,
-                    temperature=temperature,
-                    tools=tools,
-                    max_tokens=max_length,
-                    stream=stream,
-                    **extra_parameters,
-                )
+                def api_call_with_tools():
+                    return openai_client.chat.completions.create(
+                        model=self.model_name,
+                        messages=history,
+                        temperature=temperature,
+                        tools=tools,
+                        max_tokens=max_length,
+                        stream=stream,
+                        **extra_parameters,
+                    )
+                response = retry_api_call(api_call_with_tools)
                 if stream:
                     tool_calls = []
                     response_content = ""
@@ -542,7 +583,10 @@ class Chat:
                                 "content": results,
                             }
                         )
-                        response = openai_client.chat.completions.create(
+                        def api_call():
+
+                            return openai_client.chat.completions.create(
+
                             model=self.model_name,
                             messages=history,
                             tools=tools,
@@ -550,7 +594,11 @@ class Chat:
                             max_tokens=max_length,
                             stream=stream,
                             **extra_parameters,
-                        )
+                        
+
+                            )
+
+                        response = retry_api_call(api_call)
                         tool_calls = []
                         response_content = ""
                         reasoning_content = ""
@@ -607,27 +655,41 @@ class Chat:
                                 "content": results,
                             }
                         )
-                        response = openai_client.chat.completions.create(
+                        def api_call():
+
+                            return openai_client.chat.completions.create(
+
                             model=self.model_name,
                             messages=history,
                             tools=tools,
                             temperature=temperature,
                             max_tokens=max_length,
                             **extra_parameters,
-                        )
+                        
+
+                            )
+
+                        response = retry_api_call(api_call)
                         if hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                             reasoning_content = response.choices[0].message.reasoning_content
                             print(reasoning_content)
                         response_content = response.choices[0].message.content
                         print(response_content)
             elif is_tools_in_sys_prompt == "enable":
-                response = openai_client.chat.completions.create(
+                def api_call():
+
+                    return openai_client.chat.completions.create(
+
                     model=self.model_name,
                     messages=history,
                     temperature=temperature,
                     max_tokens=max_length,
                     **extra_parameters,
-                )
+                
+
+                    )
+
+                response = retry_api_call(api_call)
                 response_content = response.choices[0].message.content
                 # 正则表达式匹配
                 pattern = r'\{\s*"tool":\s*"(.*?)",\s*"parameters":\s*\{(.*?)\}\s*\}'
@@ -651,27 +713,41 @@ class Chat:
                             + "。请根据工具返回的结果继续回答我之前提出的问题。",
                         }
                     )
-                    response = openai_client.chat.completions.create(
+                    def api_call():
+
+                        return openai_client.chat.completions.create(
+
                         model=self.model_name,
                         messages=history,
                         temperature=temperature,
                         max_tokens=max_length,
                         **extra_parameters,
-                    )
+                    
+
+                        )
+
+                    response = retry_api_call(api_call)
                     if hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                         reasoning_content = response.choices[0].message.reasoning_content
                         print(reasoning_content)
                     response_content = response.choices[0].message.content
                     print(response_content)
             else:
-                response = openai_client.chat.completions.create(
+                def api_call():
+
+                    return openai_client.chat.completions.create(
+
                     model=self.model_name,
                     messages=history,
                     temperature=temperature,
                     max_tokens=max_length,
                     stream=stream,
                     **extra_parameters,
-                )
+                
+
+                    )
+
+                response = retry_api_call(api_call)
                 response_content = ""
                 reasoning_content = ""
                 if stream:
@@ -851,7 +927,10 @@ class aisuite_Chat:
             print(history)
             reasoning_content = ""
             if tools is not None:
-                response = openai_client.chat.completions.create(
+                def api_call():
+
+                    return openai_client.chat.completions.create(
+
                     model=self.model_name,
                     messages=history,
                     temperature=temperature,
@@ -859,7 +938,11 @@ class aisuite_Chat:
                     max_tokens=max_length,
                     stream=stream,
                     **extra_parameters,
-                )
+                
+
+                    )
+
+                response = retry_api_call(api_call)
                 if stream:
                     tool_calls = []
                     response_content = ""
@@ -913,7 +996,10 @@ class aisuite_Chat:
                                 "content": results,
                             }
                         )
-                        response = openai_client.chat.completions.create(
+                        def api_call():
+
+                            return openai_client.chat.completions.create(
+
                             model=self.model_name,
                             messages=history,
                             tools=tools,
@@ -921,7 +1007,11 @@ class aisuite_Chat:
                             max_tokens=max_length,
                             stream=stream,
                             **extra_parameters,
-                        )
+                        
+
+                            )
+
+                        response = retry_api_call(api_call)
                         tool_calls = []
                         response_content = ""
                         reasoning_content = ""
@@ -978,27 +1068,41 @@ class aisuite_Chat:
                                 "content": results,
                             }
                         )
-                        response = openai_client.chat.completions.create(
+                        def api_call():
+
+                            return openai_client.chat.completions.create(
+
                             model=self.model_name,
                             messages=history,
                             tools=tools,
                             temperature=temperature,
                             max_tokens=max_length,
                             **extra_parameters,
-                        )
+                        
+
+                            )
+
+                        response = retry_api_call(api_call)
                         if hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                             reasoning_content = response.choices[0].message.reasoning_content
                             print(reasoning_content)
                         response_content = response.choices[0].message.content
                         print(response_content)
             elif is_tools_in_sys_prompt == "enable":
-                response = openai_client.chat.completions.create(
+                def api_call():
+
+                    return openai_client.chat.completions.create(
+
                     model=self.model_name,
                     messages=history,
                     temperature=temperature,
                     max_tokens=max_length,
                     **extra_parameters,
-                )
+                
+
+                    )
+
+                response = retry_api_call(api_call)
                 response_content = response.choices[0].message.content
                 # 正则表达式匹配
                 pattern = r'\{\s*"tool":\s*"(.*?)",\s*"parameters":\s*\{(.*?)\}\s*\}'
@@ -1022,27 +1126,41 @@ class aisuite_Chat:
                             + "。请根据工具返回的结果继续回答我之前提出的问题。",
                         }
                     )
-                    response = openai_client.chat.completions.create(
+                    def api_call():
+
+                        return openai_client.chat.completions.create(
+
                         model=self.model_name,
                         messages=history,
                         temperature=temperature,
                         max_tokens=max_length,
                         **extra_parameters,
-                    )
+                    
+
+                        )
+
+                    response = retry_api_call(api_call)
                     if hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                         reasoning_content = response.choices[0].message.reasoning_content
                         print(reasoning_content)
                     response_content = response.choices[0].message.content
                     print(response_content)
             else:
-                response = openai_client.chat.completions.create(
+                def api_call():
+
+                    return openai_client.chat.completions.create(
+
                     model=self.model_name,
                     messages=history,
                     temperature=temperature,
                     max_tokens=max_length,
                     stream=stream,
                     **extra_parameters,
-                )
+                
+
+                    )
+
+                response = retry_api_call(api_call)
                 response_content = ""
                 reasoning_content = ""
                 if stream:
